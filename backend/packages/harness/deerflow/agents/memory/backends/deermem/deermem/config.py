@@ -276,6 +276,22 @@ class DeerMemConfig(BaseModel):
             "programmatically."
         ),
     )
+    agent_scope_externally_managed: bool = Field(
+        default=False,
+        description=(
+            "Set True by hosts that own the per-agent directory lifecycle "
+            "(deer-flow: ``AgentStore.create`` makes ``{user_dir}/agents/{name}/`` "
+            "and ``AgentStore.delete`` rmtrees it). When True, the async memory-"
+            "extraction write-back skips persisting facts for an agent whose "
+            "directory no longer exists, so a debounced / in-flight update that "
+            "lands after the agent was deleted cannot recreate the directory and "
+            "block same-name agent recreation with a 409 (issue #3364). Standalone "
+            "DeerMem (no external agent-lifecycle owner) keeps the default False "
+            "so first-write directory creation is never blocked. The check lives "
+            "on the extraction write-back path only; explicit fact CRUD, import, "
+            "and migration do not pass through it and are unaffected."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_storage_path_is_directory(self) -> DeerMemConfig:

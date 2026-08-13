@@ -17,6 +17,7 @@ from typing import Any
 
 from ..config import DeerMemConfig
 from .message_processing import detect_signals, extract_message_text
+from .paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, memory_file_path
 from .prompt import (
     format_conversation_for_update,
     load_prompt,
@@ -1222,6 +1223,20 @@ class MemoryUpdater:
         except Exception:
             logger.warning("extraction_callback raised; ignoring", exc_info=True)
 
+    def _agent_scope_directory_absent(self, agent_name: str, user_id: str | None) -> bool:
+        """Return True when the agent's on-disk directory is gone (#3364).
+
+        DeerMem co-locates each custom agent's facts under
+        ``{user_dir}/agents/{name}/``; in deer-flow that directory is created by
+        ``AgentStore.create`` and removed (rmtree) by ``AgentStore.delete``.
+        Its absence during a host-managed (``agent_scope_externally_managed``)
+        extraction write-back means the agent was deleted while this update was
+        pending or in-flight. ``agent_name`` is the DeerMem-canonical identifier
+        by the time it reaches the updater.
+        """
+        memory_path = memory_file_path(self._config, agent_name, user_id=user_id)
+        return not agent_facts_directory(memory_path, agent_name).parent.exists()
+
     def _finalize_update(
         self,
         current_memory: dict[str, Any],
@@ -1233,6 +1248,27 @@ class MemoryUpdater:
         metrics: dict[str, Any] | None = None,
     ) -> bool:
         """Parse the model response, apply updates, and persist memory."""
+        # Race guard (issue #3364): a debounced or in-flight memory extraction
+        # can reach this write-back AFTER the agent was deleted -- the host's
+        # AgentStore.delete rmtree'd the agent directory. Persisting the just-
+        # extracted facts now would ``mkdir`` the agent directory back into
+        # existence as a config-less ghost, which blocks same-name agent
+        # recreation with a 409 "already exists". When the host owns the agent
+        # directory lifecycle (agent_scope_externally_managed) and that directory
+        # is gone, drop the write instead of resurrecting it. Standalone DeerMem
+        # keeps the flag off, so its first-write directory creation is never
+        # blocked. This guard is intentionally on the async extraction
+        # write-back path: _finalize_update is only called from
+        # _do_update_memory_sync_impl, so explicit fact CRUD (create / upsert
+        # via tools), import, and migration -- which all need to create agent
+        # directories -- are never blocked, regardless of the flag.
+        if getattr(self._config, "agent_scope_externally_managed", False) and agent_name is not None and agent_name != DEFAULT_AGENT_BUCKET and self._agent_scope_directory_absent(agent_name, user_id):
+            logger.info(
+                "Skipping memory extraction write-back: agent %r was deleted while the update was pending/in-flight (thread=%s, issue #3364)",
+                agent_name,
+                thread_id,
+            )
+            return True
         update_data = _parse_memory_update_response(response_content)
         if metrics is not None:
             extracted = update_data.get("newFacts", [])

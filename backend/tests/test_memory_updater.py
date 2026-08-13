@@ -1706,3 +1706,87 @@ class TestParseMemoryUpdateFactsToRemoveGate:
         except json.JSONDecodeError:
             return
         raise AssertionError('decoy object {"user": "alice"} must be rejected')
+
+
+class TestDeletedAgentRaceGuard:
+    """Regression for issue #3364: a memory-extraction write-back landing after
+    the agent was deleted must not recreate the agent directory (which would
+    block same-name agent recreation with a 409)."""
+
+    @staticmethod
+    def _response_with_fact(content: str) -> str:
+        import json as _json
+
+        return _json.dumps(
+            {
+                "user": {},
+                "history": {},
+                "newFacts": [{**_DURABLE_USER_FACT, "content": content, "category": "context", "confidence": 0.9}],
+            }
+        )
+
+    def test_finalize_update_skips_when_agent_directory_deleted(self, tmp_path):
+        import shutil
+
+        from deerflow.agents.memory.backends.deermem.deermem.core.paths import agent_facts_directory, memory_file_path
+        from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+
+        config = _memory_config(storage_path=str(tmp_path), agent_scope_externally_managed=True)
+        storage = FileMemoryStorage(config)
+        updater = MemoryUpdater(config, storage, llm=None)
+        user_id = "alice"
+        agent_name = "race-agent"
+        memory_path = memory_file_path(config, agent_name, user_id=user_id)
+        agent_dir = agent_facts_directory(memory_path, agent_name).parent
+
+        # Agent exists (AgentStore.create made the dir); the first extraction persists.
+        agent_dir.mkdir(parents=True)
+        first = updater._finalize_update(_make_memory(), self._response_with_fact("first"), "thread-1", agent_name, user_id)
+        assert first is True
+        assert agent_dir.exists()
+
+        # Agent is deleted (AgentStore.delete rmtree). The late extraction lands.
+        shutil.rmtree(agent_dir)
+        assert not agent_dir.exists()
+        late = updater._finalize_update(_make_memory(), self._response_with_fact("late"), "thread-1", agent_name, user_id)
+        assert late is True  # a skipped best-effort write reports success
+        assert not agent_dir.exists(), "deleted agent directory must not be resurrected by a late write (#3364)"
+
+    def test_guard_inactive_in_standalone_mode(self, tmp_path):
+        """Without the host flag, a first write must still create the agent dir.
+
+        Standalone DeerMem (no external agent-lifecycle owner) keeps the flag
+        off, so the guard never fires and first-write directory creation works.
+        """
+        from deerflow.agents.memory.backends.deermem.deermem.core.paths import agent_facts_directory, memory_file_path
+        from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+
+        config = _memory_config(storage_path=str(tmp_path))  # flag defaults False
+        storage = FileMemoryStorage(config)
+        updater = MemoryUpdater(config, storage, llm=None)
+        user_id = "alice"
+        agent_name = "solo-agent"
+        memory_path = memory_file_path(config, agent_name, user_id=user_id)
+        agent_dir = agent_facts_directory(memory_path, agent_name).parent
+        assert not agent_dir.exists()
+
+        result = updater._finalize_update(_make_memory(), self._response_with_fact("first"), "thread-1", agent_name, user_id)
+        assert result is True
+        assert agent_dir.exists(), "standalone first-write must create the agent directory"
+
+    def test_guard_does_not_block_default_bucket(self, tmp_path):
+        """The internal DEFAULT_AGENT_BUCKET is never agent-lifecycle-managed:
+        even with the host flag on, writes to it must create the bucket dir."""
+        from deerflow.agents.memory.backends.deermem.deermem.core.paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, memory_file_path
+        from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+
+        config = _memory_config(storage_path=str(tmp_path), agent_scope_externally_managed=True)
+        storage = FileMemoryStorage(config)
+        updater = MemoryUpdater(config, storage, llm=None)
+        memory_path = memory_file_path(config, DEFAULT_AGENT_BUCKET, user_id="alice")
+        bucket_dir = agent_facts_directory(memory_path, DEFAULT_AGENT_BUCKET).parent
+        assert not bucket_dir.exists()
+
+        result = updater._finalize_update(_make_memory(), self._response_with_fact("default"), "thread-1", DEFAULT_AGENT_BUCKET, "alice")
+        assert result is True
+        assert bucket_dir.exists(), "DEFAULT_AGENT_BUCKET write must create its directory (guard excluded)"

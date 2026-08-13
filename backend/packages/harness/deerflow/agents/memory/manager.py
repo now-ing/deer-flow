@@ -885,6 +885,15 @@ def get_memory_manager() -> MemoryManager:
             from deerflow.config.runtime_paths import runtime_home
 
             backend_config["storage_path"] = str((Path(runtime_home()) / backend_config["storage_path"]).resolve())
+        # The host (deer-flow) owns the per-agent directory lifecycle via
+        # AgentStore.create / AgentStore.delete (rmtree), so DeerMem's async
+        # extraction write-back can safely skip a deleted agent instead of
+        # recreating its directory (issue #3364). See
+        # DeerMemConfig.agent_scope_externally_managed. ``setdefault`` honors an
+        # explicit True/False in backend_config; standalone DeerMem (which never
+        # routes through this factory) keeps the field's default False, so its
+        # first-write directory creation is never blocked.
+        backend_config.setdefault("agent_scope_externally_managed", True)
         # storage_path-is-a-file guard lives on DeerMemConfig.model_validator
         # now (DeerMem-private semantics; fires even when the factory bypassed).
         # Host hook providers: the factory supplies these as kwargs; each
