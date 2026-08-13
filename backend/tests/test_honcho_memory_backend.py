@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -68,6 +70,61 @@ class TestHonchoConfig:
             HonchoConfig.from_backend_config({"workspace_overrides": {"alice": None}})
         with pytest.raises(ValueError, match="user_peer_overrides"):
             HonchoConfig.from_backend_config({"user_peer_overrides": {"bob": "  "}})
+
+
+class TestHonchoConfigValidation:
+    """Non-positive char limits and non-finite/non-positive timeouts fail fast
+    at construction (GitHub #4782): ``text[:0]`` silently empties writes/reads
+    while ``text[:-1]`` reverse-slices (suffix deletion), and ``httpx.Timeout``
+    silently accepts ``0``/negative/``NaN``/``Inf`` that then fail late as a
+    hang or an instant-timeout-that-looks-like-an-outage."""
+
+    @pytest.mark.parametrize("limit_name", ["message_char_limit", "max_injection_chars"])
+    @pytest.mark.parametrize("bad_value", [0, -1, -1000])
+    def test_nonpositive_char_limits_rejected(self, limit_name, bad_value):
+        with pytest.raises(ValueError, match=re.escape(limit_name)):
+            HonchoConfig.from_backend_config({"base_url": "http://h", limit_name: bad_value})
+
+    @pytest.mark.parametrize("key", ["timeout_seconds", "connect_timeout_seconds"])
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -1, math.nan, math.inf, -math.inf],
+        ids=["zero", "negative", "nan", "inf", "neg-inf"],
+    )
+    def test_bad_timeouts_rejected(self, key, bad_value):
+        with pytest.raises(ValueError, match="finite, positive"):
+            HonchoConfig.from_backend_config({"base_url": "http://h", key: bad_value})
+
+    def test_positive_char_limits_and_timeouts_accepted(self):
+        """Boundary: the smallest positive values are accepted (the consumers
+        slice/truncate, they don't require headroom)."""
+        cfg = HonchoConfig.from_backend_config(
+            {
+                "base_url": "http://h",
+                "message_char_limit": 1,
+                "max_injection_chars": 1,
+                "timeout_seconds": 0.001,
+                "connect_timeout_seconds": 0.001,
+            }
+        )
+        assert cfg.message_char_limit == 1
+        assert cfg.max_injection_chars == 1
+        assert cfg.timeout_seconds == 0.001
+        assert cfg.connect_timeout_seconds == 0.001
+
+    def test_direct_construction_also_validates(self):
+        """``__post_init__`` guards every construction path, not just
+        ``from_backend_config`` -- the invariant lives on the dataclass so a
+        direct ``HonchoConfig(...)`` (e.g. in tests or a future caller) cannot
+        bypass it and reach the slice consumers with a degenerate limit."""
+        with pytest.raises(ValueError, match="message_char_limit"):
+            HonchoConfig(message_char_limit=0)
+        with pytest.raises(ValueError, match="max_injection_chars"):
+            HonchoConfig(max_injection_chars=-1)
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            HonchoConfig(timeout_seconds=math.nan)
+        with pytest.raises(ValueError, match="connect_timeout_seconds"):
+            HonchoConfig(connect_timeout_seconds=math.inf)
 
 
 class TestSanitizeId:

@@ -8,6 +8,7 @@ plain HTTP; a configured ``api_key`` over plain HTTP requires the explicit
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +34,17 @@ def _parse_override_map(cfg: dict[str, Any], key: str) -> dict[str, str]:
     return out
 
 
+def _require_positive_timeout(name: str, value: float) -> None:
+    """``httpx.Timeout`` silently accepts ``0``/negative/``NaN``/``Inf``, so a
+    bad value fails late -- a permanent hang or an instant timeout that looks
+    like a server outage -- instead of at config time. Reject anything that is
+    not a finite, positive number of seconds."""
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"Honcho backend: {name} must be a finite, positive number of seconds, got {value!r}."
+        )
+
+
 @dataclass
 class HonchoConfig:
     base_url: str = "http://localhost:8000"
@@ -48,6 +60,24 @@ class HonchoConfig:
     allow_insecure_http: bool = False
     read_fail_closed: bool = False
     storage_path: str = ""
+
+    def __post_init__(self) -> None:
+        # Non-positive char limits corrupt memory rather than limiting it:
+        # ``text[:0]`` silently empties writes/reads (a turn's content becomes
+        # an empty string, dropped server-side), and ``text[:-1]`` reverse-
+        # slices (drops a one-char suffix per call instead of capping length).
+        # Reject fail-fast at construction so no path -- ``from_backend_config``
+        # or a direct ``HonchoConfig(...)`` -- can reach the slice.
+        if self.message_char_limit <= 0:
+            raise ValueError(
+                f"Honcho backend: message_char_limit must be > 0, got {self.message_char_limit}."
+            )
+        if self.max_injection_chars <= 0:
+            raise ValueError(
+                f"Honcho backend: max_injection_chars must be > 0, got {self.max_injection_chars}."
+            )
+        _require_positive_timeout("timeout_seconds", self.timeout_seconds)
+        _require_positive_timeout("connect_timeout_seconds", self.connect_timeout_seconds)
 
     @classmethod
     def from_backend_config(cls, backend_config: dict[str, Any] | None) -> HonchoConfig:
