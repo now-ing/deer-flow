@@ -294,6 +294,50 @@ def test_internal_make_lead_agent_selects_and_normalizes_delta_state(monkeypatch
     assert middleware.state_schema is original_schema
 
 
+@pytest.mark.parametrize("agent_name", ["game", None])
+def test_bootstrap_forwards_agent_name_to_memory_scope(monkeypatch, agent_name):
+    """Regression guard for issue #4802: the bootstrap agent-creation flow
+    must forward ``agent_name`` to ``build_middlewares`` so the memory
+    middlewares (``MemoryMiddleware`` writes, ``DynamicContextMiddleware``
+    reads) scope to the agent being created instead of the ``__default__``
+    bucket. Without it, facts mined from the setup conversation pollute
+    ``__default__`` and the new agent's persona leaks into ordinary threads.
+    When no name is supplied (e.g. ``/bootstrap`` without a target name)
+    ``agent_name`` is None and behaviour must be unchanged.
+    """
+    app_config = _make_app_config([_make_model("bootstrap-model", supports_thinking=False)])
+
+    import deerflow.tools as tools_module
+
+    captured: list = []
+
+    def _capture_build_middlewares(config, model_name, agent_name=None, **kwargs):
+        captured.append(agent_name)
+        return []
+
+    monkeypatch.setattr(tools_module, "get_available_tools", lambda **kwargs: [])
+    monkeypatch.setattr(lead_agent_module, "build_middlewares", _capture_build_middlewares)
+    monkeypatch.setattr(lead_agent_module, "_load_enabled_available_skills", lambda *args, **kwargs: [])
+    monkeypatch.setattr(lead_agent_module, "create_chat_model", lambda **kwargs: object())
+    monkeypatch.setattr(lead_agent_module, "create_agent", lambda **kwargs: kwargs)
+
+    lead_agent_module._make_lead_agent(
+        {
+            "configurable": {
+                "model_name": "bootstrap-model",
+                "is_bootstrap": True,
+                "agent_name": agent_name,
+            }
+        },
+        app_config=app_config,
+    )
+
+    assert captured, "build_middlewares was not invoked on the bootstrap path"
+    assert captured[0] == agent_name, (
+        f"bootstrap build_middlewares must forward agent_name={agent_name!r}; got {captured[0]!r}"
+    )
+
+
 def test_internal_make_lead_agent_does_not_take_mode_from_runtime_context(monkeypatch):
     app_config = _make_app_config([_make_model("full-model", supports_thinking=False)])
 

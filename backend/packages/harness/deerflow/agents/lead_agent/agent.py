@@ -841,6 +841,18 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
                 build_middlewares(
                     config,
                     model_name=model_name,
+                    # Forward agent_name so the bootstrap flow's memory
+                    # (MemoryMiddleware writes, DynamicContextMiddleware
+                    # reads) is scoped to the agent being created rather
+                    # than the __default__ bucket. When the caller supplies
+                    # the target name (Web UI "create agent"), facts mined
+                    # from the setup conversation land in that agent's
+                    # bucket; when it is absent (e.g. ``/bootstrap`` without
+                    # a name) agent_name is None and behaviour is unchanged.
+                    # Omitting this was the root cause of issue #4802:
+                    # bootstrap facts polluted __default__ and leaked the
+                    # new agent's persona into ordinary threads.
+                    agent_name=agent_name,
                     available_skills=set(_BOOTSTRAP_SKILL_NAMES),
                     app_config=resolved_app_config,
                     deferred_setup=setup,
