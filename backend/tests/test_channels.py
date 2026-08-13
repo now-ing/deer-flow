@@ -1052,6 +1052,101 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_dispatch_loop_bounds_live_handler_tasks_under_burst(self, tmp_path):
+        """A large inbound burst must not spawn unbounded handler tasks.
+
+        Regression for issue #4801: admission used to be acquired inside
+        ``_handle_message``, so a burst only limited handlers already in their
+        critical section while still creating one task per message (~100k live
+        tasks waiting for a slot on a 100k burst). The dispatch loop now
+        acquires the slot before spawning, so the live handler-task population
+        (``manager._handler_tasks``) never exceeds ``max_concurrency``.
+        """
+        from app.channels.manager import ChannelManager
+
+        max_concurrency = 3
+        total = 40
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=tmp_path / "store.json")
+            manager = ChannelManager(bus=bus, store=store, max_concurrency=max_concurrency)
+            processed: list[str] = []
+            peak = 0
+            gate = asyncio.Event()
+
+            async def blocking_chat(msg, **kwargs):
+                nonlocal peak
+                # Snapshot the live handler-task population — exactly the
+                # quantity the bug let grow unbounded.
+                peak = max(peak, len(manager._handler_tasks))
+                try:
+                    await gate.wait()
+                finally:
+                    processed.append(msg.chat_id)
+
+            manager._handle_chat = blocking_chat
+            await manager.start()
+            try:
+                for i in range(total):
+                    await bus.publish_inbound(
+                        InboundMessage(channel_name="test", chat_id=f"c{i}", user_id="u", text="hi")
+                    )
+                # At capacity the dispatch loop parks on semaphore.acquire(),
+                # so live tasks sit exactly at max_concurrency — never higher.
+                await _wait_for(lambda: len(manager._handler_tasks) == max_concurrency)
+                # Give a regression (spawn-first, gate-later) room to overshoot.
+                await asyncio.sleep(0.1)
+                assert len(manager._handler_tasks) <= max_concurrency
+                assert peak <= max_concurrency
+                gate.set()
+                await _wait_for(lambda: len(processed) == total)
+            finally:
+                await manager.stop()
+
+            assert len(processed) == total
+            assert peak == max_concurrency  # bound was actually reached
+            assert len(manager._handler_tasks) == 0
+
+        _run(go())
+
+    def test_stop_drains_in_flight_handler_tasks(self, tmp_path):
+        """stop() must own and cancel in-flight handler tasks (issue #4801).
+
+        Before the fix, handler tasks were neither tracked nor drained by
+        stop(), so an in-flight handler outlived shutdown as an orphan. Now
+        every spawned handler lives in ``_handler_tasks`` and stop() cancels
+        and awaits each, leaving none behind.
+        """
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=tmp_path / "store.json")
+            manager = ChannelManager(bus=bus, store=store, max_concurrency=2)
+            gate = asyncio.Event()
+            entered = asyncio.Event()
+
+            async def blocking_chat(msg, **kwargs):
+                entered.set()
+                await gate.wait()
+
+            manager._handle_chat = blocking_chat
+            await manager.start()
+            await bus.publish_inbound(
+                InboundMessage(channel_name="test", chat_id="c1", user_id="u", text="hi")
+            )
+            await _wait_for(lambda: len(manager._handler_tasks) == 1)
+            await entered.wait()
+            assert len(manager._handler_tasks) == 1
+
+            # stop() cancels+awaits the parked handler; must not hang or leak it.
+            await asyncio.wait_for(manager.stop(), timeout=5.0)
+
+            assert len(manager._handler_tasks) == 0
+
+        _run(go())
+
     def test_inbound_dedupe_key_fails_closed_without_workspace(self):
         """Without a workspace identifier, skip dedupe instead of collapsing workspaces (willem #3)."""
         from app.channels.manager import ChannelManager

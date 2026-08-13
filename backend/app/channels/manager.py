@@ -1049,6 +1049,15 @@ class ChannelManager:
         # run after this manager has been shut down. Discarded via the same
         # task's done-callback (see _maybe_spawn_followup_watcher).
         self._followup_watcher_tasks: set[asyncio.Task] = set()
+        # In-flight inbound handler tasks (one per dequeued message), tracked
+        # for the same reason as the watchers above and for the admission
+        # bound in _dispatch_loop: the dispatch loop acquires a semaphore
+        # slot *before* spawning each handler (see _run_bounded_handler), so
+        # the live population of this set never exceeds max_concurrency even
+        # under a large inbound burst (issue #4801). stop() cancels+awaits
+        # every member so handlers cannot outlive shutdown. Discarded via the
+        # task's own done-callback.
+        self._handler_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _channel_supports_streaming(channel_name: str) -> bool:
@@ -1605,6 +1614,27 @@ class ChannelManager:
                 logger.exception("[Manager] follow-up watcher task raised during stop()")
         self._followup_watcher_tasks.clear()
 
+        # In-flight inbound handlers are spawned by the dispatch loop above
+        # (one task per dequeued message) and tracked in self._handler_tasks.
+        # Cancelling only self._task would leave any handler still running —
+        # or parked on a semaphore slot it already holds — as an orphan that
+        # outlives shutdown (issue #4801). Cancel+await each so stop() owns
+        # their full lifecycle, mirroring the follow-up-watcher handling.
+        # Runs may take minutes, so we cancel rather than block shutdown on a
+        # graceful drain; _run_bounded_handler's finally still releases the
+        # admission slot on the way out.
+        handler_tasks = list(self._handler_tasks)
+        for task in handler_tasks:
+            task.cancel()
+        for task in handler_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("[Manager] handler task raised during stop()")
+        self._handler_tasks.clear()
+
         logger.info("ChannelManager stopped")
 
     # -- dispatch loop -----------------------------------------------------
@@ -1635,8 +1665,36 @@ class ChannelManager:
                 len(msg.text or ""),
                 len(msg.files),
             )
-            task = asyncio.create_task(self._handle_message(msg))
+            # Bound the live handler-task population: acquire an admission
+            # slot BEFORE spawning so the number of in-flight handler tasks
+            # never exceeds max_concurrency. Previously the slot was acquired
+            # inside _handle_message, which only capped handlers already in
+            # their critical section while still creating one task per
+            # message — a 100k burst spawned ~100k tasks all parked waiting
+            # for a slot (issue #4801). Acquiring here applies backpressure
+            # to the dispatch loop itself; _run_bounded_handler releases the
+            # slot on every exit path.
+            await self._semaphore.acquire()
+            task = asyncio.create_task(self._run_bounded_handler(msg))
+            self._handler_tasks.add(task)
+            task.add_done_callback(self._handler_tasks.discard)
             task.add_done_callback(self._log_task_error)
+
+    async def _run_bounded_handler(self, msg: InboundMessage) -> None:
+        """Run one inbound handler while owning one admission slot.
+
+        The dispatch loop acquires the semaphore slot before spawning this
+        wrapper (see ``_dispatch_loop``), so the live handler-task count is
+        bounded by ``max_concurrency``. This wrapper owns the paired release
+        and must run it on every exit — including cancellation during
+        ``stop()`` — so admission slots never leak. ``_handle_message`` is
+        kept semaphore-free so direct unit-test callers and the bound-identity
+        rejection path are unaffected by the admission bound.
+        """
+        try:
+            await self._handle_message(msg)
+        finally:
+            self._semaphore.release()
 
     @staticmethod
     def _inbound_dedupe_key(msg: InboundMessage) -> tuple[str, str, str, str] | None:
@@ -1714,12 +1772,17 @@ class ChannelManager:
             logger.error("[Manager] unhandled error in message task: %s", exc, exc_info=exc)
 
     async def _handle_message(self, msg: InboundMessage) -> None:
+        # Admission is bounded one level up: _dispatch_loop acquires a
+        # semaphore slot before spawning _run_bounded_handler (which calls
+        # this method), so this body runs already holding a slot and must not
+        # re-acquire one. Direct unit-test callers invoke this method without
+        # a slot, which is fine — there is no semaphore use here to break.
         msg = _apply_effective_owner(msg)
         try:
-            # Non-command chat can be rejected before it consumes a semaphore
-            # slot. Commands are handled below because provider adapters consume
-            # binding commands before manager dispatch, and _handle_command()
-            # applies its own admission gate for manager-level commands.
+            # Commands skip the bound-identity gate because provider adapters
+            # consume binding commands before manager dispatch, and
+            # _handle_command() applies its own admission gate for manager-level
+            # commands.
             bound_identity_rejection = None
             if msg.msg_type != InboundMessageType.COMMAND:
                 bound_identity_rejection = await self._get_bound_identity_rejection(msg)
@@ -1727,11 +1790,10 @@ class ChannelManager:
                 await self._reject_unbound_channel_message(msg, bound_identity_rejection=bound_identity_rejection)
                 return
 
-            async with self._semaphore:
-                if msg.msg_type == InboundMessageType.COMMAND:
-                    await self._handle_command(msg)
-                else:
-                    await self._handle_chat(msg, bound_identity_checked=True)
+            if msg.msg_type == InboundMessageType.COMMAND:
+                await self._handle_command(msg)
+            else:
+                await self._handle_chat(msg, bound_identity_checked=True)
         except InvalidChannelSessionConfigError as exc:
             logger.warning(
                 "Invalid channel session config for %s (chat=%s): %s",
