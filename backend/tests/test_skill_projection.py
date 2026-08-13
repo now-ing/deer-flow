@@ -74,6 +74,61 @@ def test_projection_contains_only_enabled_skills(projection_env) -> None:
     assert not (projected.public / "disabled-skill").exists()
 
 
+def test_bash_cannot_read_disabled_skill_through_projection(projection_env) -> None:
+    """Regression guard for #4107: bash must not bypass the disabled-skill gate.
+
+    The durable fix (#4178) projects enabled skills only, so a disabled skill's
+    files never exist on the mount root that the bash tool resolves through
+    PathMapping. This exercises that guarantee at the bash layer — a real
+    ``LocalSandbox.execute_command`` shell subprocess with container→host path
+    resolution — and asserts a disabled skill's secret is unreachable via
+    ``cat``/``grep``/``ls`` while an enabled peer stays readable.
+    """
+    from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
+
+    env = projection_env
+    secret = "super-secret-token-4107"
+    _write_skill(env.skills_root / "public", "enabled-skill", "public-marker")
+    disabled_dir = env.skills_root / "public" / "disabled-skill"
+    disabled_dir.mkdir(parents=True, exist_ok=True)
+    (disabled_dir / "SKILL.md").write_text(
+        f"---\nname: disabled-skill\ndescription: leaks\n---\n\nTOKEN={secret}\n",
+        encoding="utf-8",
+    )
+    env.extensions.skills["disabled-skill"] = SkillStateConfig(enabled=False)
+
+    projected = rebuild_skill_projections(env.storage)
+    # The enabled-only projection is the only skills surface a sandbox mounts.
+    assert (projected.public / "enabled-skill" / "SKILL.md").is_file()
+    assert not (projected.public / "disabled-skill").exists()
+
+    sandbox = LocalSandbox(
+        "test-bash-4107",
+        [PathMapping(container_path="/mnt/skills/public", local_path=str(projected.public), read_only=True)],
+    )
+
+    # ``cat`` of the disabled SKILL.md resolves to a path the projection never
+    # materialized, so the secret never reaches bash output.
+    cat_output = sandbox.execute_command("cat /mnt/skills/public/disabled-skill/SKILL.md")
+    assert secret not in cat_output
+    assert "No such file or directory" in cat_output
+
+    # A recursive ``grep`` across the mounted skills root cannot find the secret.
+    grep_output = sandbox.execute_command(f"grep -rl '{secret}' /mnt/skills/public/ || true")
+    assert secret not in grep_output
+    assert "disabled-skill" not in grep_output
+
+    # ``ls`` of the skills root does not even name the disabled skill.
+    ls_output = sandbox.execute_command("ls /mnt/skills/public")
+    assert "enabled-skill" in ls_output
+    assert "disabled-skill" not in ls_output
+
+    # The enabled peer remains fully readable through the same mount.
+    enabled_output = sandbox.execute_command("cat /mnt/skills/public/enabled-skill/SKILL.md")
+    assert "public-marker" in enabled_output
+    assert secret not in enabled_output
+
+
 def test_projection_rebuild_removes_newly_disabled_skill(projection_env) -> None:
     env = projection_env
     _write_skill(env.skills_root / "public", "demo-skill")
