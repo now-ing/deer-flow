@@ -2,6 +2,7 @@
 
 import errno
 import os
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -116,16 +117,72 @@ class TestWriteUploadFileNoSymlink:
         assert dest == tmp_path / "notes.txt"
         assert dest.read_bytes() == b"hello"
 
-    def test_overwrites_existing_regular_file_with_single_link(self, tmp_path):
-        dest = tmp_path / "notes.txt"
-        dest.write_bytes(b"old contents")
-        assert os.stat(dest).st_nlink == 1
+    def test_same_name_upload_allocates_unique_name_not_overwrite(self, tmp_path):
+        # Regression for #3750: a same-name upload must not silently overwrite an
+        # existing file. O_EXCL atomically allocates notes_1.txt so both versions
+        # are preserved on disk.
+        existing = tmp_path / "notes.txt"
+        existing.write_bytes(b"old contents")
+        assert os.stat(existing).st_nlink == 1
 
         result = write_upload_file_no_symlink(tmp_path, "notes.txt", b"new contents")
 
-        assert result == dest
-        assert dest.read_bytes() == b"new contents"
-        assert os.stat(dest).st_nlink == 1
+        assert result == tmp_path / "notes_1.txt"
+        assert existing.read_bytes() == b"old contents"
+        assert result.read_bytes() == b"new contents"
+        assert os.stat(existing).st_nlink == 1
+        assert os.stat(result).st_nlink == 1
+
+    def test_repeated_same_name_uploads_increment_suffix(self, tmp_path):
+        # report.pdf -> report_1.pdf -> report_2.pdf, each keeps its own content.
+        first = write_upload_file_no_symlink(tmp_path, "report.pdf", b"v1")
+        second = write_upload_file_no_symlink(tmp_path, "report.pdf", b"v2")
+        third = write_upload_file_no_symlink(tmp_path, "report.pdf", b"v3")
+
+        assert first.name == "report.pdf"
+        assert second.name == "report_1.pdf"
+        assert third.name == "report_2.pdf"
+        assert first.read_bytes() == b"v1"
+        assert second.read_bytes() == b"v2"
+        assert third.read_bytes() == b"v3"
+
+    def test_concurrent_same_name_uploads_never_interleave_or_lose_content(self, tmp_path):
+        # Concurrency regression for #3750: many same-name uploads racing for the
+        # same filename must each land in their own exclusive file with their full
+        # payload intact (no interleaved / truncated / mixed bytes, no shared inode).
+        n_threads = 16
+        payload = b"abcdef0123456789" * 256  # 4 KiB, large enough to detect tearing
+        barrier = threading.Barrier(n_threads)
+        results: list = [(None, None)] * n_threads
+
+        def writer(idx: int) -> None:
+            barrier.wait()  # release all threads simultaneously
+            try:
+                dest = write_upload_file_no_symlink(tmp_path, "race.bin", payload)
+                results[idx] = (dest, None)
+            except BaseException as exc:  # pragma: no cover - surface unexpected failures
+                results[idx] = (None, exc)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        errors = [r[1] for r in results if r[1] is not None]
+        assert not errors, f"some concurrent writers failed: {errors}"
+
+        dests = [r[0] for r in results]
+        names = {d.name for d in dests}
+        # Every writer must have received a distinct on-disk name (no shared inode).
+        assert len(names) == n_threads, f"name collision: only {len(names)} unique names for {n_threads} writers"
+        # Every file must be a separate regular file with the full payload intact.
+        for d in dests:
+            assert d.read_bytes() == payload, f"truncated/interleaved content in {d.name}"
+            assert os.stat(d).st_nlink == 1
+        # No partial / garbled files left behind in the directory.
+        written = [p for p in tmp_path.iterdir() if p.is_file()]
+        assert len(written) == n_threads
 
     def test_fallback_without_no_follow_support_succeeds(self, tmp_path, monkeypatch):
         monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)

@@ -959,11 +959,16 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage, *, user_id:
                 logger.exception("[Manager] failed to write inbound file: %s", dest)
                 continue
 
+            # write_upload_file_no_symlink allocates the on-disk name atomically via
+            # O_EXCL; under a concurrent same-name race it may differ from the claimed
+            # safe_name (report.pdf -> report_1.pdf). Record the actual destination so
+            # listings/deletes reference the file that was truly written.
+            actual_name = dest.name
             created.append(
                 {
-                    "filename": safe_name,
+                    "filename": actual_name,
                     "size": len(data),
-                    "path": f"/mnt/user-data/uploads/{safe_name}",
+                    "path": f"/mnt/user-data/uploads/{actual_name}",
                     "is_image": ftype == "image",
                 }
             )

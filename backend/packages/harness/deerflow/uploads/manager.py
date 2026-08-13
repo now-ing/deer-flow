@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 UPLOAD_STAGING_PREFIX = ".upload-"
 UPLOAD_STAGING_SUFFIX = ".part"
 
+# Upper bound on O_EXCL suffix-increment attempts (report.pdf -> report_1.pdf ->
+# report_2.pdf ...). 10000 is far beyond any realistic collision chain and caps
+# the loop if an adversary pre-creates every variant; exhaustion raises
+# UnsafeUploadPathError so callers can surface a clean error instead of looping.
+_UNIQUE_NAME_MAX_ATTEMPTS = 10000
+
 
 def get_uploads_dir(thread_id: str, *, user_id: str | None = None) -> Path:
     """Return the uploads directory path for a thread (no side effects)."""
@@ -174,34 +180,96 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
     and ``fstat`` validation after ``open()`` to reduce the TOCTOU window; this does
     not eliminate all races but makes exploitation significantly harder. Path-traversal
     validation prevents escapes from *base_dir* in both cases.
+
+    The destination is created atomically with ``O_EXCL``: if the requested name
+    already exists on disk (a prior upload, or a concurrent same-name upload that
+    won the race), a ``_N`` suffix is incremented on the stem (``report.pdf`` ->
+    ``report_1.pdf`` -> ...) until a free name is found. Because ``O_EXCL`` makes
+    create-or-fail atomic, two concurrent same-name uploads can never open the same
+    inode and interleave/truncate each other's bytes. The returned :class:`Path` is
+    the *actual* destination the caller's bytes will land in; callers must record
+    this path's name (not the originally requested filename) as the stored filename.
     """
     safe_name = normalize_filename(filename)
-    dest = validate_upload_destination(base_dir, safe_name)
-    try:
-        st = os.lstat(dest)
-    except FileNotFoundError:
-        st = None
-
+    base = Path(base_dir)
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
     has_nofollow = hasattr(os, "O_NOFOLLOW")
 
-    if has_nofollow:
-        # POSIX: O_NOFOLLOW makes open() fail with ELOOP if dest is a symlink.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-        if hasattr(os, "O_NONBLOCK"):
-            flags |= os.O_NONBLOCK
+    # Atomically allocate a unique destination via O_EXCL. If the requested name
+    # already exists on disk (a prior upload, or a concurrent same-name upload that
+    # won the race), increment a ``_N`` suffix on the stem until a free name is
+    # found. O_EXCL makes create-or-fail atomic, so two concurrent same-name
+    # uploads can never open the same inode and interleave/truncate each other.
+    for attempt_idx in range(_UNIQUE_NAME_MAX_ATTEMPTS):
+        attempt_name = safe_name if attempt_idx == 0 else f"{stem}_{attempt_idx}{suffix}"
+        dest = validate_upload_destination(base, attempt_name)
+
+        if has_nofollow:
+            # POSIX: O_NOFOLLOW makes open() fail with ELOOP if dest is a symlink.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+
+            try:
+                fd = os.open(dest, flags, 0o600)
+            except FileExistsError:
+                continue  # Name taken (prior file or concurrent race) -> next suffix.
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
+                    raise UnsafeUploadPathError(f"Unsafe upload destination: {attempt_name}") from exc
+                raise
+
+            try:
+                opened_stat = os.fstat(fd)
+                if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+                    raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {attempt_name}")
+                # O_EXCL created a fresh empty file; no ftruncate needed.
+                fh = os.fdopen(fd, "wb")
+                fd = -1
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            return dest, fh
+
+        # Windows: no O_NOFOLLOW available. Uses a second lstat immediately before open()
+        # to narrow the TOCTOU window, then fstat after open() as a further defence.
+        # Note: a narrow race window remains between the pre-open lstat and open(); the
+        # path-traversal check mitigates escapes from base_dir but cannot prevent an
+        # attacker who can atomically replace dest with a symlink after the check.
+        try:
+            st = os.lstat(dest)
+        except FileNotFoundError:
+            st = None
+        if st is not None and st.st_nlink > 1:
+            raise UnsafeUploadPathError(f"Upload destination has multiple links: {attempt_name}")
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+
+        try:
+            pre_open_st = os.lstat(dest)
+        except FileNotFoundError:
+            pre_open_st = None
+
+        if pre_open_st is not None and not stat.S_ISREG(pre_open_st.st_mode):
+            raise UnsafeUploadPathError(f"Upload destination is not a regular file: {attempt_name}")
+        if pre_open_st is not None and pre_open_st.st_nlink > 1:
+            raise UnsafeUploadPathError(f"Upload destination has multiple links: {attempt_name}")
 
         try:
             fd = os.open(dest, flags, 0o600)
+        except FileExistsError:
+            continue
         except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
-                raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
+            if exc.errno in {errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
+                raise UnsafeUploadPathError(f"Unsafe upload destination: {attempt_name}") from exc
             raise
 
         try:
             opened_stat = os.fstat(fd)
-            if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
-                raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
-            os.ftruncate(fd, 0)
+            if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink > 1:
+                raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {attempt_name}")
             fh = os.fdopen(fd, "wb")
             fd = -1
         finally:
@@ -209,46 +277,7 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
                 os.close(fd)
         return dest, fh
 
-    # Windows: no O_NOFOLLOW available. Uses a second lstat immediately before open()
-    # to narrow the TOCTOU window, then fstat after open() as a further defence.
-    # Note: a narrow race window remains between the pre-open lstat and open(); the
-    # path-traversal check mitigates escapes from base_dir but cannot prevent an
-    # attacker who can atomically replace dest with a symlink after the check.
-    if st is not None and st.st_nlink > 1:
-        raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
-
-    flags = os.O_WRONLY | os.O_CREAT
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-
-    try:
-        pre_open_st = os.lstat(dest)
-    except FileNotFoundError:
-        pre_open_st = None
-
-    if pre_open_st is not None and not stat.S_ISREG(pre_open_st.st_mode):
-        raise UnsafeUploadPathError(f"Upload destination is not a regular file: {safe_name}")
-    if pre_open_st is not None and pre_open_st.st_nlink > 1:
-        raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
-
-    try:
-        fd = os.open(dest, flags, 0o600)
-    except OSError as exc:
-        if exc.errno in {errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
-            raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
-        raise
-
-    try:
-        opened_stat = os.fstat(fd)
-        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink > 1:
-            raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
-        os.ftruncate(fd, 0)
-        fh = os.fdopen(fd, "wb")
-        fd = -1
-    finally:
-        if fd >= 0:
-            os.close(fd)
-    return dest, fh
+    raise UnsafeUploadPathError(f"Could not allocate a unique upload filename for {safe_name!r} after {_UNIQUE_NAME_MAX_ATTEMPTS} attempts")
 
 
 def write_upload_file_no_symlink(base_dir: Path, filename: str, data: bytes) -> Path:
